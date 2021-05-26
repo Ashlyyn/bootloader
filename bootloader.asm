@@ -6,7 +6,7 @@
 .global boot
 
 boot:
-	ljmp 0x0000, .flush_CS
+	ljmp 0x0000, .flush_CS	# flush cs in case BIOS set it to 0x07C0
 
 .flush_CS:
 	cld		
@@ -14,11 +14,12 @@ boot:
 
 	xor ax, ax
 	mov ds, ax
-	mov es, ax
-	mov ss, ax
+	mov es, ax	# zero ds and es
+	mov ss, ax	# intialize stack to 0x0000:0x7C00
+			# (directly below bootloader)
 
 	movb [disk], dl
-
+	
 .check_CPUID:
 	pushfd
 	pop eax
@@ -43,55 +44,91 @@ boot:
 	test edx, (1 << 29)
 	jz .no_lmode
 
-	mov ax, 0x2401
-	int 0x15		#enable A20 Gate
-	
-	mov ax, 0x03
-	int 0x10		#set VGA text mode to 3
-
 	mov ax, 0x0217		# ah = 0x02 (read sector function of int 0x13), al = 17 (read sectors 2-18)
 	mov bx, 0x7E00		# es:bx = memory location to copy data into, es already zeroed
 	mov cx, 0x0002		# ch = 0x00 (track idx), cl = 0x02 (sector idx to start reading from)
 	movzxb dx, [disk]	# dh = 0x00 (head idx), dl = drive number
 	int 0x13		# copy data
 
-	mov di, PAGE_TABLE_BUFFER
+	mov ax, 0x2401
+	int 0x15		#enable A20 Gate
+	
+	mov ax, 0x03
+	int 0x10		#set VGA text mode to 3
+
+.int15:
+	mov eax, 0xE820		# int 0x15 subfunction - get memory map	
+	xor ebx, ebx		# clear ebx
+	mov ecx, 24 		# request 24 byte entries
+	mov edx, 0x0534D4150 	# magic number for interrupt
+	mov di, PAGE_TABLE_BUFFER_TEMP + 0x4004 # set di to second dword immediately after end of page table
+	movb [di + 20], 0x01 # force a valid ACPI 3.X entry
+	xor bp, bp		# zero bp for counter (interrupt clobbers all other registers besides si)
+	int 0x15
+	jc .int15_failed	# interrupt failed if carry set
+	mov edx, 0x0534D4150	# reset edx in case interrupt clobbered it (some BIOSes do)
+	cmp eax, edx		# if success, eax = magic number
+	jne .int15_failed	# else failed
+	test ebx, ebx		# if ebx = 0, list is only 1 entry long - useless
+	jz .int15_failed
+	jmp .int15_cont
+.int15_failed:
+	cli
+	hlt
+
+.int15_loop:
+	mov ax, 0xE820		# ax clobbered by interrupt
+	movb [di + 20], 0x01 # force a valid ACPI 3.X entry
+	mov ecx, 24		# request 24-byte entry
+	int 0x15
+	jc .int15_failed	# if carry set, end of list already reached
+	mov edx, 0x0534D4150	# edx potentially clobbered by interrupt
+.int15_cont:
+	jcxz .skip_entry	# skip entry if length = 0
+	cmp cl, 20		# if entry is 24 bytes, entry is ACPI 3.0 type
+	jbe .not_ACPI
+	testb [di + 20], 0x01 	# 0x01 = ignore data flag
+	jz .skip_entry
+.not_ACPI:
+	mov ecx, [di + 8]	# get lower uint32_t of memory region length
+	or ecx,  [di + 12]	# OR" it with upper uint32_t to test for zero
+	jz .skip_entry		# if length uint64_t is 0, skip entry
+	inc bp			# else got a good entry, increment counter)
+	add di, 24		# and set pointer to next entry
+.skip_entry:
+	test ebx, ebx		# if ebx resets to 0, list is complete
+	jnz .int15_loop		# else loop
+.int15_finished:
+	movw ax, [disk]
+	movw [PAGE_TABLE_BUFFER_TEMP + 0x4000], bp 	# store the entry count at begining of list
 
 .switch_lmode:
+	mov di, PAGE_TABLE_BUFFER_TEMP
 	push di
 
-	mov cx, 0x1400
+	mov cx, 0x1000
 	xor eax, eax
 	cld
 	rep stosd		#zero out page table buffer
 
 	pop di
 
-	movw [di], PAGE_TABLE_BUFFER + 0x1003	   
-	# &PML4T[0] = PAGE_TABLE_BUFFER + 0x0, PML4T[0] = &PDPT | 0x03
-	movw [di + 0x1000], PAGE_TABLE_BUFFER + 0x2003 
-	# &PDPT[0] = PAGE_TABLE_BUFFER + 0x1000, PDPT[0] = &PDT | 0x03
-	mov di, PAGE_TABLE_BUFFER + 0x2000   	   
-	# &PDT[0] = PAGE_TABLE_BUFFER + 0x2000
-	mov ax, PAGE_TABLE_BUFFER + 0x3003  	  	
-	mov cx, 512
-.pageTableLoop:	 		#  PDT[0..511] = &PT[0..511] | 0x03
-	mov [di], ax
-	add di, 8
-	dec cx
-	test cx, cx
-	jnz .pageTableLoop
-
-	mov di, PAGE_TABLE_BUFFER + 0x3000		
-	# &PT[0] = PAGE_TABLE_BUFFER + 0x3000
+	movw [di], PAGE_TABLE_BUFFER_TEMP + 0x1003	   
+	# &PML4T[0] = PAGE_TABLE_BUFFER_TEMP + 0x0000, PML4T[0] = &PDPT | 0x03
+	movw [di + 0x1000], PAGE_TABLE_BUFFER_TEMP + 0x2003 
+	# &PDPT[0] = PAGE_TABLE_BUFFER_TEMP + 0x1000, PDPT[0] = &PDT | 0x03
+	movw [di + 0x2000], PAGE_TABLE_BUFFER_TEMP + 0x3003 
+	# &PDT[0] = PAGE_TABLE_BUFFER_TEMP + 0x2000, PDT[0] = &PT | 0x03
+	mov di, PAGE_TABLE_BUFFER_TEMP + 0x3000		
+	# &PT[0] = PAGE_TABLE_BUFFER_TEMP + 0x3000
 	mov ax, 0x03
 .pagesLoop:
-	# &PT[0] = PAGE_TABLE_BUFFER + 0x3000
+	# &PT[0] = PAGE_TABLE_BUFFER_TEMP + 0x3000
 	#  PT[i] = (0x1000 * i) | 0x03
 	mov [di], eax	      # identity map pages
 	add eax, 0x1000
 	add di, 8
-	cmp di, PAGE_TABLE_BUFFER + 0x4000
+	cmp di, PAGE_TABLE_BUFFER_TEMP + 0x4000
 	jl .pagesLoop
 
 	mov al, 0xFF
@@ -103,7 +140,7 @@ boot:
 	mov eax, 0b10100000	
 	mov cr4, eax		#enable paging and PAE
 	
-	mov edi, PAGE_TABLE_BUFFER		
+	mov edi, PAGE_TABLE_BUFFER_TEMP		
 	mov cr3, edi		#copy page table pointer to cr3
 
 	mov ecx, EFER
@@ -129,29 +166,69 @@ boot:
 
 	
 .no_CPUID:
-	mov si, .no_CPUID_str
-	call .printstr
+	mov si, no_CPUID_str
+	call printstr_rmode
 	cli
 	hlt
 .no_lmode:
-	mov si, .no_lmode_str
-	call .printstr
+	mov si, no_lmode_str
+	call printstr_rmode
 	cli 
 	hlt
 
-.printstr:
+printstr_rmode:
 	lodsb
 	test al, al
 	jz .done
 	mov ah, 0x0E
 	int 0x10
-	jmp .printstr
+	jmp printstr_rmode
 .done:
 	ret
 
-.no_CPUID_str: .ascii "ERROR: FATAL: CPU does not support CPUID."
-.no_lmode_str: .ascii "ERROR: FATAL: CPU does not support Long Mode."
+dummy_IDT: 
+	.word 0x00
+	.long 0x00	
 
+disk: .byte 0x00
+no_CPUID_str: .ascii "ERROR: FATAL: CPU does not support CPUID."
+no_lmode_str: .ascii "ERROR: FATAL: CPU does not support Long Mode."
+
+.space 510 - (. - boot), 0
+.word 0xAA55
+
+.code64
+lmode:
+	mov ax, KERNEL_DATA_SEG
+	mov ds, ax
+	mov es, ax
+	mov fs, ax
+	mov gs, ax
+	mov ss, ax		# set selector registers
+
+	cli			# disable interrupts until IDT set up
+
+	xor rax, rax
+	xor rbx, rbx
+	xor rcx, rcx
+	xor rdx, rdx
+	xor rdi, rdi		# zero GPRs (rsi previously zeroed)
+
+	mov rsp, 0x200000
+	mov rbp, rsp		# initialize stack to top of kernel memory
+
+	call init		# init()
+
+	cli
+	hlt
+
+init:			# put down here just to keep the assembler happy
+	mov rdi, 0xB8000
+	movw [rdi], 0x035A
+	ret
+
+syscall_handler:
+	sysretq
 
 GDT:
 .null:
@@ -204,41 +281,4 @@ GDT_ptr:
 	.word $ - GDT - 1
 	.long GDT
 
-dummy_IDT: 
-	.word 0x00
-	.long 0x00	
 
-disk: .byte 0x00
-
-.code64
-
-.space 510 - (. - boot), 0
-.word 0xAA55
-
-copy:
-lmode:
-	mov ax, KERNEL_DATA_SEG
-	mov ds, ax
-	mov es, ax
-	mov fs, ax
-	mov gs, ax
-	mov ss, ax		#set selector registers
-
-	cli			#disable interrupts until IDT set up
-
-	xor rax, rax
-	xor rbx, rbx
-	xor rcx, rcx
-	xor rdx, rdx
-	xor rdi, rdi		#zero GPRs (rsi previously zeroed)
-
-	mov rsp, 0x4000000
-	mov rbp, rsp		#initialize stack to top of kernel memory
-
-	call init		#init()
-
-	cli
-	hlt
-
-init:			# put down here just to keep the assembler happy
-syscall_handler:
