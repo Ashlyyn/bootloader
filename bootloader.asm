@@ -4,6 +4,7 @@
 
 .section .boot
 .global boot
+.global init
 
 boot:
 	ljmp 0x0000, .flush_CS	# flush cs in case BIOS set it to 0x07C0
@@ -18,8 +19,20 @@ boot:
 	mov ss, ax	# intialize stack to 0x0000:0x7C00
 			# (directly below bootloader)
 
-	movb [disk], dl
-	
+	movb [disk], dl	
+
+	mov ax, 0x0241		# ah = 0x02 (read sector function of int 0x13), al = 65 (read 65 sectors)
+				# sector count could theoretically be 255, but 65 is the max that can be read
+				# without crossing a segment boundary
+				# 65 sectors is roughly 33k of disk space, so make sure you have disk drivers
+				# up and running before your kernel binary grows beyond this size, else
+				# some data will not be loaded
+	mov bx, 0x7E00		# es:bx = memory location to copy data into, es already zeroed
+	mov cx, 0x0002		# ch = 0x00 (track idx), cl = 0x02 (sector idx to start reading from)
+	xor dh, dh		# dh = 0x00 (head idx), dl = drive number (implicitly placed in dl by BIOS on startup)
+	int 0x13		# copy data
+
+
 .check_CPUID:
 	pushfd
 	pop eax
@@ -44,12 +57,6 @@ boot:
 	test edx, (1 << 29)
 	jz .no_lmode
 
-	mov ax, 0x0217		# ah = 0x02 (read sector function of int 0x13), al = 17 (read sectors 2-18)
-	mov bx, 0x7E00		# es:bx = memory location to copy data into, es already zeroed
-	mov cx, 0x0002		# ch = 0x00 (track idx), cl = 0x02 (sector idx to start reading from)
-	movzxb dx, [disk]	# dh = 0x00 (head idx), dl = drive number
-	int 0x13		# copy data
-
 	mov ax, 0x2401
 	int 0x15		#enable A20 Gate
 	
@@ -61,8 +68,8 @@ boot:
 	xor ebx, ebx		# clear ebx
 	mov ecx, 24 		# request 24 byte entries
 	mov edx, 0x0534D4150 	# magic number for interrupt
-	mov di, PAGE_TABLE_BUFFER_TEMP + 0x4004 # set di to second dword immediately after end of page table
-	movb [di + 20], 0x01 # force a valid ACPI 3.X entry
+	mov di, E820_BUFFER 	# set di to second dword immediately after end of page table
+	movb [di + 20], 0x01 	# force a valid ACPI 3.X entry
 	xor bp, bp		# zero bp for counter (interrupt clobbers all other registers besides si)
 	int 0x15
 	jc .int15_failed	# interrupt failed if carry set
@@ -78,7 +85,7 @@ boot:
 
 .int15_loop:
 	mov ax, 0xE820		# ax clobbered by interrupt
-	movb [di + 20], 0x01 # force a valid ACPI 3.X entry
+	movb [di + 20], 0x01 	# force a valid ACPI 3.X entry
 	mov ecx, 24		# request 24-byte entry
 	int 0x15
 	jc .int15_failed	# if carry set, end of list already reached
@@ -100,7 +107,7 @@ boot:
 	jnz .int15_loop		# else loop
 .int15_finished:
 	movw ax, [disk]
-	movw [PAGE_TABLE_BUFFER_TEMP + 0x4000], bp 	# store the entry count at begining of list
+	movw [E820_ENTRY_COUNT], bp 	# store the entry count at begining of list
 
 .switch_lmode:
 	mov di, PAGE_TABLE_BUFFER_TEMP
@@ -191,8 +198,6 @@ dummy_IDT:
 	.long 0x00	
 
 disk: .byte 0x00
-no_CPUID_str: .ascii "ERROR: FATAL: CPU does not support CPUID."
-no_lmode_str: .ascii "ERROR: FATAL: CPU does not support Long Mode."
 
 .space 510 - (. - boot), 0
 .word 0xAA55
@@ -221,11 +226,6 @@ lmode:
 
 	cli
 	hlt
-
-init:			# put down here just to keep the assembler happy
-	mov rdi, 0xB8000
-	movw [rdi], 0x035A
-	ret
 
 syscall_handler:
 	sysretq
@@ -276,9 +276,11 @@ GDT:
 	#.byte 0x00		# base 16:23 = 0x0000
 	#.word 0x0000		# base 0:15  = 0x0000
 	#.word 0x0000		# limit 0:15 = 0x0000
+GDT_end:
 
 GDT_ptr: 
-	.word $ - GDT - 1
+	.word GDT_end - GDT - 1
 	.long GDT
 
-
+no_CPUID_str: .ascii "ERROR: FATAL: CPU does not support CPUID."
+no_lmode_str: .ascii "ERROR: FATAL: CPU does not support Long Mode."
