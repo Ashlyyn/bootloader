@@ -2,4 +2,6 @@
 **/.o
 **/.swp
 *.o
-
+*.bin
+obj/
+build/
